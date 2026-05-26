@@ -1,0 +1,14 @@
+{
+  "latitude": 51.458,
+  "longitude": 0.208,
+  "tilt": 35,
+  "azimuth": 45,
+  "recipient_email": "sambathknair@gmail.com",
+  "smtp": {
+    "server": "smtp.gmail.com",
+    "port": 587,
+    "use_tls": true,
+    "sender_email": "your_email@gmail.com",
+    "sender_password": "your_app_password"
+  }
+}

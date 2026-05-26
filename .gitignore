@@ -1,0 +1,13 @@
+# Sensitive configurations
+config.json
+
+# Local preview outputs
+last_email.html
+last_email.txt
+
+# Python temporary files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
