@@ -165,6 +165,39 @@ def analyze_forecast(data):
         "hourly_data": tomorrow_hours
     }
 
+def format_whatsapp_message(report):
+    weather_desc, weather_emoji = get_weather_desc(report["weather_code"])
+    
+    msg = f"☀️ *Solar Charging Advisor* ⚡\n"
+    msg += f"Date: {report['date'].strftime('%A, %b %d, %Y')}\n"
+    msg += f"Rating: *{report['rating']}* ({weather_emoji} {weather_desc})\n\n"
+    
+    msg += f"🔋 *Optimal Charging Window*:\n"
+    msg += f"👉 *{report['window']}* 👈\n"
+    msg += f"({report['duration']} hour(s) of high-yield solar)\n\n"
+    
+    msg += f"📊 *Key Metrics*:\n"
+    msg += f"• Est. Energy: {report['total_energy']:.2f} kWh/m²\n"
+    msg += f"• Peak Intensity: {report['peak_gti']:.0f} W/m²\n"
+    msg += f"• Avg Temperature: {report['avg_temp']:.1f}°C\n"
+    msg += f"• Avg Cloud Cover: {report['avg_cloud']:.0f}%\n\n"
+    
+    msg += f"📅 *Hourly Forecast*:\n"
+    msg += "```"  # Start monospaced formatting
+    msg += "Time      Irrad.    Cloud\n"
+    msg += "-------------------------\n"
+    for h in report["hourly_data"]:
+        hour = h["time"].hour
+        if 6 <= hour <= 20:
+            time_str = h["time"].strftime("%I:%M %p")
+            gti_str = f"{h['gti']:.0f} W/m²"
+            cloud_str = f"{h['cloud']}%"
+            msg += f"{time_str:<9} {gti_str:<10} {cloud_str:>4}\n"
+    msg += "```"  # End monospaced formatting
+    
+    msg += f"\nDartford DA1 5UB, UK (SW facing)"
+    return msg
+
 def format_text_email(report):
     weather_desc, weather_emoji = get_weather_desc(report["weather_code"])
     
@@ -211,11 +244,11 @@ def format_html_email(report):
             
             # Apply color based on irradiance strength
             if h["gti"] >= 400:
-                bar_color = "linear-gradient(90deg, #f59e0b 0%, #eab308 100%)" # bright solar gold
+                bar_color = "linear-gradient(90deg, #f59e0b 0%, #eab308 100%)"
             elif h["gti"] >= 150:
-                bar_color = "linear-gradient(90deg, #3b82f6 0%, #60a5fa 100%)" # mild daylight blue
+                bar_color = "linear-gradient(90deg, #3b82f6 0%, #60a5fa 100%)"
             else:
-                bar_color = "linear-gradient(90deg, #475569 0%, #64748b 100%)" # low intensity grey-blue
+                bar_color = "linear-gradient(90deg, #475569 0%, #64748b 100%)"
                 
             hourly_rows += f"""
             <tr style="border-bottom: 1px solid #1e293b;">
@@ -349,11 +382,10 @@ def send_email(config, subject, html_content, text_content):
     port = smtp_conf.get("port", 587)
     use_tls = smtp_conf.get("use_tls", True)
     
-    # Check if we should dry run
     dry_run = "--dry-run" in sys.argv
     
     if not sender or not password or not server_addr or dry_run:
-        print("Running in Dry Run / Local Saving mode.")
+        print("Running in Email Dry Run / Local Saving mode.")
         html_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "last_email.html")
         txt_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "last_email.txt")
         
@@ -363,10 +395,6 @@ def send_email(config, subject, html_content, text_content):
             f.write(text_content)
             
         print(f"Saved email copy to:\n  HTML: {html_file}\n  Text: {txt_file}")
-        if dry_run:
-            print("Reason: --dry-run flag was set.")
-        else:
-            print("Reason: SMTP configuration in config.json is incomplete.")
         return False
         
     msg = MIMEMultipart('alternative')
@@ -409,6 +437,55 @@ def send_email(config, subject, html_content, text_content):
         print(f"Saved email copy locally to {html_file} due to transmission failure.")
         return False
 
+def send_whatsapp(config, message):
+    wa_conf = config.get("whatsapp", {})
+    phone = wa_conf.get("phone", "")
+    apikey = wa_conf.get("apikey", "")
+    
+    dry_run = "--dry-run" in sys.argv
+    
+    if not phone or not apikey or dry_run:
+        print("Running in WhatsApp Dry Run / Local Saving mode.")
+        txt_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "last_whatsapp.txt")
+        with open(txt_file, "w", encoding="utf-8") as f:
+            f.write(message)
+        print(f"Saved WhatsApp message to:\n  Text: {txt_file}")
+        
+        if not apikey:
+            print("\n--- ACTION REQUIRED: ACTIVATE WHATSAPP NOTIFICATIONS ---")
+            print("To send WhatsApp messages directly to your phone, get a free CallMeBot API key:")
+            print("1. Add the CallMeBot number to your phone contacts: +34 644 97 53 59 (or +34 644 10 55 37)")
+            print("2. Send this exact message to it via WhatsApp: I allow callmebot to send me messages")
+            print("3. Wait for the reply message containing your APIKEY.")
+            print("4. Copy that APIKEY into the 'apikey' field in config.json.")
+            print("---------------------------------------------------------\n")
+        return False
+        
+    # URL encode parameters for CallMeBot GET request
+    params = urllib.parse.urlencode({
+        "phone": phone,
+        "text": message,
+        "apikey": apikey
+    })
+    url = f"https://api.callmebot.com/whatsapp.php?{params}"
+    
+    try:
+        print(f"Sending WhatsApp message to {phone}...")
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=15) as response:
+            resp_content = response.read().decode('utf-8')
+            print("CallMeBot Server Response:", resp_content)
+            print("WhatsApp message successfully sent!")
+            return True
+    except Exception as e:
+        print(f"Error sending WhatsApp message: {e}", file=sys.stderr)
+        # Save locally as fallback
+        txt_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "last_whatsapp.txt")
+        with open(txt_file, "w", encoding="utf-8") as f:
+            f.write(message)
+        print(f"Saved message locally to {txt_file} as a fallback.")
+        return False
+
 def main():
     try:
         config = load_config()
@@ -416,15 +493,22 @@ def main():
         lon = config["longitude"]
         tilt = config["tilt"]
         azimuth = config["azimuth"]
+        channel = config.get("channel", "whatsapp").lower()
         
         raw_data = fetch_forecast(lat, lon, tilt, azimuth)
         report = analyze_forecast(raw_data)
         
-        subject = f"Solar Charging Advisory: {report['rating']} potential tomorrow ({report['date'].strftime('%b %d')})"
-        text_content = format_text_email(report)
-        html_content = format_html_email(report)
-        
-        send_email(config, subject, html_content, text_content)
+        # Route depending on channel preference
+        if channel in ("whatsapp", "both"):
+            whatsapp_msg = format_whatsapp_message(report)
+            send_whatsapp(config, whatsapp_msg)
+            
+        if channel in ("email", "both"):
+            subject = f"Solar Charging Advisory: {report['rating']} potential tomorrow ({report['date'].strftime('%b %d')})"
+            text_content = format_text_email(report)
+            html_content = format_html_email(report)
+            send_email(config, subject, html_content, text_content)
+            
         print("Forecast compilation complete.")
     except Exception as e:
         print(f"Fatal execution error: {e}", file=sys.stderr)

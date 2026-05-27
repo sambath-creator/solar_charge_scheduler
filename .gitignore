@@ -4,6 +4,7 @@ config.json
 # Local preview outputs
 last_email.html
 last_email.txt
+last_whatsapp.txt
 
 # Python temporary files
 __pycache__/

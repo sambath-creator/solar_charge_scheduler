@@ -3,7 +3,12 @@
   "longitude": 0.208,
   "tilt": 35,
   "azimuth": 45,
+  "channel": "whatsapp",
   "recipient_email": "sambathknair@gmail.com",
+  "whatsapp": {
+    "phone": "your_phone_number_international_format_like_+447823372929",
+    "apikey": "your_callmebot_apikey"
+  },
   "smtp": {
     "server": "smtp.gmail.com",
     "port": 587,
