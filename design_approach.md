@@ -1,24 +1,46 @@
-# Solar Charging Scheduler Design Approach
+# Solar Charging & Agile Octopus Scheduler Design Approach
 
-This document outlines the design decisions, mathematical models, and architectural framework chosen to implement the Solar Charging Scheduler.
+This document outlines the design decisions, mathematical models, and architectural framework chosen to implement the Solar Charging Scheduler and Agile Octopus Tariff Optimizer.
 
 ---
 
-## 1. System Architecture
+## 1. System Architecture & Deployment
 
-The agent is designed to run locally, minimizing external service dependencies. It uses a zero-dependency Python structure scheduled by standard OS processes.
+The agent is designed to run in two environments:
+1. **Cloud Deployment (Serverless via GitHub Actions)**: The primary deployment environment. It executes in the cloud daily at 7:00 PM UTC without local machine dependencies. Secure credentials are loaded via **GitHub Secrets**.
+2. **Local Deployment (Windows Task Scheduler)**: A fallback environment running locally on a daily 7:00 PM schedule. It resolves configuration values using `config.json`.
 
 ```mermaid
 graph TD
-    A[Windows Task Scheduler <br> 7:00 PM Daily] -->|Triggers| B(run.bat)
-    B -->|Invokes| C(solar_scheduler.py)
-    C -->|Reads| D[config.json]
-    C -->|GET HTTP| E[Open-Meteo API]
-    E -->|Returns JSON| C
-    C -->|Calculates Window| F{SMTP Configured?}
-    F -->|No / Dry Run| G[Save Local HTML/Text <br> last_email.html]
-    F -->|Yes| H[Send SMTP Email]
-    H -->|To| I[sambathknair@gmail.com]
+    subgraph Cloud Deployment
+        A1[GitHub Actions Cron <br> 7:00 PM UTC] -->|Triggers| A2[runner-vm]
+        A2 -->|Loads| A3[GitHub Repository Secrets]
+        A3 -->|Sets Environment Variables| A4(solar_scheduler.py)
+    end
+    
+    subgraph Local Deployment
+        B1[Windows Task Scheduler <br> 7:00 PM Daily] -->|Triggers| B2(run.bat)
+        B2 -->|Invokes| B3(solar_scheduler.py)
+        B3 -->|Reads| B4[config.json]
+    end
+
+    A4 --> C{Fetch Data}
+    B3 --> C
+    
+    C -->|GET HTTP| D[Open-Meteo Solar API]
+    C -->|GET HTTP| E[Octopus Energy Tariff API]
+    
+    D -->|GTI Forecast| F[Core Processing Engine]
+    E -->|Agile Unit Rates| F
+    
+    F -->|Renders & Routes| G{Channel Selection}
+    G -->|WhatsApp| H[CallMeBot Gateway]
+    G -->|Email| I[SMTP Mail Server]
+    
+    H -->|Deliver Text| J[WhatsApp Recipient]
+    I -->|Deliver HTML/Text| K[Email Recipient]
+    
+    G -->|Dry Run / Missing Credentials| L[Save to Local Files <br> last_whatsapp.txt / last_email.html]
 ```
 
 ---
@@ -28,11 +50,11 @@ graph TD
 ### Panel Orientation Coordinates
 For a property in Dartford, UK:
 - **Latitude & Longitude**: Resolved to `51.458° N, 0.208° E`.
-- **Tilt**: The default is set to `35°` relative to the horizontal, capturing optimal year-round sunlight in the UK.
-- **Azimuth**: Open-Meteo uses the convention: `0° = South`, `90° = West`. Since the panels face South-West, the azimuth is mathematically mapped to `45°`.
+- **Tilt**: Default is `35°` relative to the horizontal (optimal year-round tilt in the UK).
+- **Azimuth**: Open-Meteo uses the convention: `0° = South`, `90° = West`. Since the panels face South-West, the azimuth is mapped to `45°`.
 
 ### Global Tilted Irradiance (GTI)
-Instead of using standard Global Horizontal Irradiance (GHI) which assumes flat panels, the agent fetches **Global Tilted Irradiance (GTI)**. The Open-Meteo API calculates this dynamically using the specified `tilt` and `azimuth` to estimate the real sunlight hitting the SW-angled panel plane.
+Instead of standard Global Horizontal Irradiance (GHI) which assumes flat panels, the agent fetches **Global Tilted Irradiance (GTI)**. The Open-Meteo API calculates this dynamically using the specified `tilt` and `azimuth` to estimate the real sunlight hitting the SW-angled panel plane.
 
 ### Optimal Battery Charging Window Algorithm
 We define the window based on peak daily intensity to maximize charging efficiency:
@@ -48,26 +70,41 @@ We define the window based on peak daily intensity to maximize charging efficien
      $$\text{GTI}(h) \geq I_{\text{threshold}} \quad \text{and} \quad I_{\text{peak}} \geq 20 \text{ W/m}^2$$
    - The charging window begins at the minimum qualified hour $h_{\text{start}}$ and ends at $h_{\text{end}} + 1$ (representing the end of the last hourly block).
 
-### Solar Rating System
-Days are categorized dynamically to give users context at a glance:
-- **Excellent**: $\geq 5.0\text{ kWh/m}^2$ (Max battery charging potential)
-- **Good**: $3.0\text{ to }5.0\text{ kWh/m}^2$ (Highly efficient charging)
-- **Moderate**: $1.5\text{ to }3.0\text{ kWh/m}^2$ (Partial charging)
-- **Poor**: $< 1.5\text{ kWh/m}^2$ (Minimal charging utility)
+---
+
+## 3. Agile Octopus Tariff Optimization
+
+The agent queries the public Octopus Energy API to extract half-hourly unit rates:
+- **Product Code**: `AGILE-24-10-01` (Active Agile Octopus tariff product).
+- **Tariff Code**: `E-1R-AGILE-24-10-01-J` (Region `J` corresponds to GSP Group _\_J_, representing South Eastern England/Dartford).
+
+### Algorithmic Processing of Tariff Data
+1. **Query Date-Filtered Window**: The agent queries rates for the target forecast date (tomorrow) using `period_from` and `period_to` parameters.
+2. **Fallback Logic**: If the script is run before tomorrow's rates are published (which occurs daily at 4:00 PM UK time), it falls back to the most complete date available in the active API response.
+3. **Cheapest Slots Sorting**: 
+   - The list of 48 half-hour slots is sorted in **ascending order** of unit price (`value_inc_vat`).
+   - The **top 6 cheapest slots** are extracted.
+   - These 6 slots are presented in two structures:
+     - **By Price (Ascending)**: For instant comparison of the absolute cheapest slots.
+     - **By Time (Chronological)**: To simplify programming home battery or appliance scheduling software.
 
 ---
 
-## 3. UI/UX & Email Aesthetics
+## 4. UI/UX & Output Formats
 
-To ensure a high-end experience, the email is structured like a premium SaaS dashboard:
-* **Dark Theme Palette**: Employs slate-blue backgrounds (`#0a0f1d` and `#0f172a`) to match modern smart home aesthetics.
-* **Glassmorphism Metrics**: High-priority data cards feature glowing gradients (e.g. golden yellow for battery/sun intensity).
-* **Relative Strength Bars**: The hourly breakdown features inline CSS data bars mapping the percentage of relative irradiance relative to the day's peak, allowing the user to scan the peak hours visually in under 2 seconds.
+### WhatsApp Text Report
+To maintain a high-end mobile experience, the text is structured using WhatsApp's formatting keys:
+*   **Asterisks (`*`)** for bold titles.
+*   **Triple Backticks (<code>```</code>)** to enclose the hourly solar forecast and the Agile Octopus rates. This forces a monospaced font layout in WhatsApp, aligning columns perfectly like a physical table.
+*   **Emojis** for rating status (☀️, ⛅, 🌧️, etc.) to allow fast cognitive scanning.
+
+### Email (HTML)
+The HTML template utilizes a slate-blue dashboard style. For the tariff section, it inserts an Agile Octopus card showing the top 6 slots with a distinct glowing gold badge highlighting the single absolute cheapest slot of the day.
 
 ---
 
-## 4. Robustness & Portability
+## 5. Robustness & Cloud Portability
 
-- **No Third-Party Python Dependencies**: The core script uses standard libraries (`urllib`, `smtplib`, `ssl`, etc.) to run on any machine containing a Python installation without executing complex environment setup.
-- **Fail-Safe "Dry-Run" Mode**: If SMTP parameters are missing or an error occurs during email transmission, the script does not crash. It automatically creates local text and HTML files (`last_email.txt` / `last_email.html`) and log details to let the user preview the output easily.
-- **Windows Task Scheduler Integration**: Windows Task Scheduler executes a batch script (`run.bat`) which resolves relative file paths locally, preventing errors caused by running the script from different active folders.
+*   **Zero-Dependency Design**: Built using standard Python libraries (`urllib`, `smtplib`, etc.), ensuring it runs in any standard Python environment without requiring packages like `requests`.
+*   **Hybrid Configuration Engine**: Reads settings from `config.json` when running locally, but overrides them with environment variables when executed in a container or pipeline. This allows repository code to remain public while secrets (API keys/credentials) are stored in secure environment vaults (like GitHub Actions Secrets).
+*   **Graceful Degradation**: If an external API is down or credentials are not provided, it writes data locally to preview files (`last_whatsapp.txt` / `last_email.html`) and prints setup instructions rather than raising fatal runtime exceptions.

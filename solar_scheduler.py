@@ -12,10 +12,36 @@ import sys
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.json')
 
 def load_config():
-    if not os.path.exists(CONFIG_PATH):
-        raise FileNotFoundError(f"Config file not found at {CONFIG_PATH}")
-    with open(CONFIG_PATH, 'r') as f:
-        return json.load(f)
+    config = {}
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH, 'r') as f:
+                config = json.load(f)
+        except Exception as e:
+            print(f"Warning: Failed to parse config.json ({e}). Using defaults.", file=sys.stderr)
+            
+    # Override with Environment Variables if available (useful for GitHub Actions)
+    config["latitude"] = float(os.environ.get("SOLAR_LATITUDE", config.get("latitude", 51.458)))
+    config["longitude"] = float(os.environ.get("SOLAR_LONGITUDE", config.get("longitude", 0.208)))
+    config["tilt"] = float(os.environ.get("SOLAR_TILT", config.get("tilt", 35)))
+    config["azimuth"] = float(os.environ.get("SOLAR_AZIMUTH", config.get("azimuth", 45)))
+    config["channel"] = os.environ.get("SOLAR_CHANNEL", config.get("channel", "whatsapp")).lower()
+    config["recipient_email"] = os.environ.get("SOLAR_RECIPIENT_EMAIL", config.get("recipient_email", "sambathknair@gmail.com"))
+    
+    if "whatsapp" not in config:
+        config["whatsapp"] = {}
+    config["whatsapp"]["phone"] = os.environ.get("WHATSAPP_PHONE", config["whatsapp"].get("phone", "+447823372929"))
+    config["whatsapp"]["apikey"] = os.environ.get("WHATSAPP_APIKEY", config["whatsapp"].get("apikey", ""))
+    
+    if "smtp" not in config:
+        config["smtp"] = {}
+    config["smtp"]["server"] = os.environ.get("SMTP_SERVER", config["smtp"].get("server", "smtp.gmail.com"))
+    config["smtp"]["port"] = int(os.environ.get("SMTP_PORT", config["smtp"].get("port", 587)))
+    config["smtp"]["use_tls"] = os.environ.get("SMTP_USE_TLS", str(config["smtp"].get("use_tls", True))).lower() == "true"
+    config["smtp"]["sender_email"] = os.environ.get("SENDER_EMAIL", config["smtp"].get("sender_email", ""))
+    config["smtp"]["sender_password"] = os.environ.get("SENDER_PASSWORD", config["smtp"].get("sender_password", ""))
+    
+    return config
 
 def get_weather_desc(code):
     wmo_codes = {
@@ -77,7 +103,6 @@ def analyze_forecast(data):
     cloud = hourly.get("cloud_cover", [])
     code = hourly.get("weather_code", [])
     
-    # Group times by date to identify tomorrow
     dates = sorted(list(set(datetime.datetime.strptime(t, "%Y-%m-%dT%H:%M").date() for t in times)))
     
     if len(dates) >= 2:
@@ -85,7 +110,7 @@ def analyze_forecast(data):
     else:
         tomorrow = dates[0]
         
-    print(f"Analyzing forecast for date: {tomorrow}")
+    print(f"Analyzing solar forecast for date: {tomorrow}")
     
     tomorrow_hours = []
     for t, g, tp, cl, cd in zip(times, gti, temp, cloud, code):
@@ -103,25 +128,19 @@ def analyze_forecast(data):
         raise ValueError("No hourly forecast records found for tomorrow.")
         
     total_gti = sum(h["gti"] for h in tomorrow_hours)
-    # Total energy is sum(hourly_gti) Wh/m2, convert to kWh/m2
     total_energy_kwh = total_gti / 1000.0
-    
     peak_gti = max(h["gti"] for h in tomorrow_hours)
     
-    # Filter daylight hours for calculating averages (6 AM to 8 PM)
     daylight_hours = [h for h in tomorrow_hours if 6 <= h["time"].hour <= 20]
     avg_temp = sum(h["temp"] for h in daylight_hours) / len(daylight_hours) if daylight_hours else 0.0
     avg_cloud = sum(h["cloud"] for h in daylight_hours) / len(daylight_hours) if daylight_hours else 0.0
     
-    # Determine overall weather code (most frequent daylight code)
     if daylight_hours:
         codes = [h["code"] for h in daylight_hours]
         overall_code = max(set(codes), key=codes.count)
     else:
         overall_code = 0
         
-    # Calculate optimal charging window
-    # Defined as hours where GTI >= 50% of the peak value and peak_gti > 20 W/m2
     charging_hours = []
     threshold = 0.5 * peak_gti
     if peak_gti > 20.0:
@@ -129,7 +148,6 @@ def analyze_forecast(data):
         
     if charging_hours:
         start_hour = min(h["time"] for h in charging_hours)
-        # End hour is the last hour + 1 to denote the full block
         end_hour = max(h["time"] for h in charging_hours) + datetime.timedelta(hours=1)
         window_str = f"{start_hour.strftime('%I:%M %p')} - {end_hour.strftime('%I:%M %p')}"
         duration = len(charging_hours)
@@ -137,19 +155,18 @@ def analyze_forecast(data):
         window_str = "No suitable window"
         duration = 0
         
-    # Rate the day's solar potential
     if total_energy_kwh >= 5.0:
         rating = "Excellent"
-        rating_color = "#10b981" # Emerald Green
+        rating_color = "#10b981"
     elif total_energy_kwh >= 3.0:
         rating = "Good"
-        rating_color = "#3b82f6" # Blue
+        rating_color = "#3b82f6"
     elif total_energy_kwh >= 1.5:
         rating = "Moderate"
-        rating_color = "#f59e0b" # Amber
+        rating_color = "#f59e0b"
     else:
         rating = "Poor"
-        rating_color = "#ef4444" # Red
+        rating_color = "#ef4444"
         
     return {
         "date": tomorrow,
@@ -165,25 +182,142 @@ def analyze_forecast(data):
         "hourly_data": tomorrow_hours
     }
 
-def format_whatsapp_message(report):
+def fetch_octopus_rates():
+    # Agile Octopus Product Code: AGILE-24-10-01, Region J (South Eastern England)
+    url = "https://api.octopus.energy/v1/products/AGILE-24-10-01/electricity-tariffs/E-1R-AGILE-24-10-01-J/standard-unit-rates/"
+    
+    tomorrow = datetime.date.today() + datetime.timedelta(days=1)
+    from_str = tomorrow.strftime("%Y-%m-%dT00:00:00Z")
+    to_str = tomorrow.strftime("%Y-%m-%dT23:59:59Z")
+    
+    params = {
+        "period_from": from_str,
+        "period_to": to_str
+    }
+    query_string = urllib.parse.urlencode(params)
+    full_url = f"{url}?{query_string}"
+    
+    print(f"Fetching Agile Octopus rates from: {full_url}")
+    req = urllib.request.Request(full_url, headers={'User-Agent': 'Mozilla/5.0'})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as response:
+            data = json.loads(response.read().decode())
+            results = data.get("results", [])
+            # Fallback if no results returned for tomorrow
+            if not results:
+                print("No tomorrow rates published yet. Fetching latest available rates page...")
+                req_fallback = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                with urllib.request.urlopen(req_fallback, timeout=15) as resp_fallback:
+                    data_fallback = json.loads(resp_fallback.read().decode())
+                    results = data_fallback.get("results", [])
+            return results
+    except Exception as e:
+        print(f"Error fetching Octopus rates: {e}", file=sys.stderr)
+        return []
+
+def process_octopus_rates(results, target_date):
+    day_rates = []
+    for r in results:
+        try:
+            valid_from = datetime.datetime.strptime(r["valid_from"], "%Y-%m-%dT%H:%M:%SZ")
+        except ValueError:
+            valid_from = datetime.datetime.strptime(r["valid_from"][:19], "%Y-%m-%dT%H:%M:%S")
+            
+        if valid_from.date() == target_date:
+            day_rates.append({
+                "time": valid_from,
+                "value": float(r["value_inc_vat"])
+            })
+            
+    # Fallback to the most frequent date in the response if target_date has no records
+    if not day_rates and results:
+        dates_in_results = []
+        for r in results:
+            try:
+                dt = datetime.datetime.strptime(r["valid_from"], "%Y-%m-%dT%H:%M:%SZ")
+            except ValueError:
+                dt = datetime.datetime.strptime(r["valid_from"][:19], "%Y-%m-%dT%H:%M:%S")
+            dates_in_results.append(dt.date())
+            
+        if dates_in_results:
+            fallback_date = max(set(dates_in_results), key=dates_in_results.count)
+            print(f"Target date {target_date} not available. Using fallback date: {fallback_date}")
+            target_date = fallback_date
+            for r in results:
+                try:
+                    dt = datetime.datetime.strptime(r["valid_from"], "%Y-%m-%dT%H:%M:%SZ")
+                except ValueError:
+                    dt = datetime.datetime.strptime(r["valid_from"][:19], "%Y-%m-%dT%H:%M:%S")
+                if dt.date() == fallback_date:
+                    day_rates.append({
+                        "time": dt,
+                        "value": float(r["value_inc_vat"])
+                    })
+                    
+    if not day_rates:
+        return {
+            "date": target_date,
+            "by_price": [],
+            "by_time": []
+        }
+        
+    # Sort by price ascending to extract top 6
+    cheapest = sorted(day_rates, key=lambda x: x["value"])
+    top_6 = cheapest[:6]
+    
+    # Sort configurations:
+    # 1. Sorted by price ascending (cheapest first)
+    top_6_by_price = sorted(top_6, key=lambda x: x["value"])
+    # 2. Sorted by time ascending (chronological flow)
+    top_6_by_time = sorted(top_6, key=lambda x: x["time"])
+    
+    return {
+        "date": target_date,
+        "by_price": top_6_by_price,
+        "by_time": top_6_by_time
+    }
+
+def format_whatsapp_message(report, octopus_report):
     weather_desc, weather_emoji = get_weather_desc(report["weather_code"])
     
     msg = f"☀️ *Solar Charging Advisor* ⚡\n"
     msg += f"Date: {report['date'].strftime('%A, %b %d, %Y')}\n"
     msg += f"Rating: *{report['rating']}* ({weather_emoji} {weather_desc})\n\n"
     
-    msg += f"🔋 *Optimal Charging Window*:\n"
+    msg += f"🔋 *Optimal Solar Charging*:\n"
     msg += f"👉 *{report['window']}* 👈\n"
     msg += f"({report['duration']} hour(s) of high-yield solar)\n\n"
     
-    msg += f"📊 *Key Metrics*:\n"
+    msg += f"📊 *Solar Metrics*:\n"
     msg += f"• Est. Energy: {report['total_energy']:.2f} kWh/m²\n"
     msg += f"• Peak Intensity: {report['peak_gti']:.0f} W/m²\n"
     msg += f"• Avg Temperature: {report['avg_temp']:.1f}°C\n"
     msg += f"• Avg Cloud Cover: {report['avg_cloud']:.0f}%\n\n"
     
-    msg += f"📅 *Hourly Forecast*:\n"
-    msg += "```"  # Start monospaced formatting
+    if octopus_report and octopus_report["by_price"]:
+        msg += f"💰 *Agile Octopus Rates* ({octopus_report['date'].strftime('%b %d')}):\n"
+        msg += f"*(Top 6 Cheapest - Sorted Ascending)*\n"
+        msg += "```"
+        msg += "Time      Price (inc VAT)\n"
+        msg += "-------------------------\n"
+        for r in octopus_report["by_price"]:
+            time_str = r["time"].strftime("%I:%M %p")
+            val_str = f"{r['value']:.2f} p/kWh"
+            msg += f"{time_str:<9} {val_str:<15}\n"
+        msg += "```\n"
+        
+        msg += f"📅 *Top 6 Chronological Flow*:\n"
+        msg += "```"
+        msg += "Time      Price (inc VAT)\n"
+        msg += "-------------------------\n"
+        for r in octopus_report["by_time"]:
+            time_str = r["time"].strftime("%I:%M %p")
+            val_str = f"{r['value']:.2f} p/kWh"
+            msg += f"{time_str:<9} {val_str:<15}\n"
+        msg += "```\n"
+        
+    msg += f"📅 *Hourly Solar Forecast*:\n"
+    msg += "```"
     msg += "Time      Irrad.    Cloud\n"
     msg += "-------------------------\n"
     for h in report["hourly_data"]:
@@ -193,12 +327,12 @@ def format_whatsapp_message(report):
             gti_str = f"{h['gti']:.0f} W/m²"
             cloud_str = f"{h['cloud']}%"
             msg += f"{time_str:<9} {gti_str:<10} {cloud_str:>4}\n"
-    msg += "```"  # End monospaced formatting
+    msg += "```"
     
     msg += f"\nDartford DA1 5UB, UK (SW facing)"
     return msg
 
-def format_text_email(report):
+def format_text_email(report, octopus_report):
     weather_desc, weather_emoji = get_weather_desc(report["weather_code"])
     
     text = f"""Solar Charging Forecast - {report['date'].strftime('%A, %b %d, %Y')}
@@ -216,7 +350,16 @@ Key Forecast Metrics:
 * Peak Solar Intensity: {report['peak_gti']:.0f} W/m²
 * Daylight Avg Temp: {report['avg_temp']:.1f}°C
 * Daylight Avg Cloud Cover: {report['avg_cloud']:.0f}%
+"""
 
+    if octopus_report and octopus_report["by_price"]:
+        text += f"\nAgile Octopus Rates ({octopus_report['date'].strftime('%b %d')}):\n"
+        text += "---------------------\n"
+        text += "Top 6 Cheapest timeslots (sorted ascending):\n"
+        for r in octopus_report["by_price"]:
+            text += f"* {r['time'].strftime('%I:%M %p')} : {r['value']:.2f} p/kWh\n"
+
+    text += """
 Hourly Breakdown (06:00 - 20:00):
 ----------------------------------
 """
@@ -231,10 +374,9 @@ Hourly Breakdown (06:00 - 20:00):
     text += f"\nLocation: 9 Foster Drive, Dartford DA1 5UB, UK\nPanels: South-West facing (Tilt: 35°, Azimuth: 45°)\nGenerated at {datetime.datetime.now().strftime('%Y-%m-%d %I:%M %p')}\n"
     return text
 
-def format_html_email(report):
+def format_html_email(report, octopus_report):
     weather_desc, weather_emoji = get_weather_desc(report["weather_code"])
     
-    # Format rows for hourly breakdown
     hourly_rows = ""
     for h in report["hourly_data"]:
         hour = h["time"].hour
@@ -242,7 +384,6 @@ def format_html_email(report):
             time_str = h["time"].strftime("%I:%M %p")
             percentage = (h["gti"] / report["peak_gti"] * 100) if report["peak_gti"] > 0 else 0
             
-            # Apply color based on irradiance strength
             if h["gti"] >= 400:
                 bar_color = "linear-gradient(90deg, #f59e0b 0%, #eab308 100%)"
             elif h["gti"] >= 150:
@@ -264,7 +405,44 @@ def format_html_email(report):
             </tr>
             """
             
-    # HTML string
+    octopus_section = ""
+    if octopus_report and octopus_report["by_price"]:
+        octopus_rows = ""
+        for r in octopus_report["by_price"]:
+            time_str = r["time"].strftime("%I:%M %p")
+            val_str = f"{r['value']:.2f} p/kWh"
+            
+            is_cheapest = r == octopus_report["by_price"][0]
+            bg_style = 'background-color: #eab30811; font-weight: 700;' if is_cheapest else ''
+            accent_style = 'color: #fbbf24;' if is_cheapest else 'color: #f8fafc;'
+            badge = '<span style="background-color: #fbbf24; color: #000; font-size: 9px; font-weight: 800; padding: 2px 6px; border-radius: 10px; margin-left: 8px;">CHEAPEST</span>' if is_cheapest else ''
+            
+            octopus_rows += f"""
+            <tr style="border-bottom: 1px solid #1e293b; {bg_style}">
+                <td style="padding: 12px 8px; color: #94a3b8; font-size: 14px;">{time_str} {badge}</td>
+                <td style="padding: 12px 8px; {accent_style} font-size: 14px; text-align: right;">{val_str}</td>
+            </tr>
+            """
+            
+        octopus_section = f"""
+        <!-- Agile Octopus Tariff -->
+        <h3 style="font-size: 15px; font-weight: 700; color: #f8fafc; text-transform: uppercase; letter-spacing: 0.05em; border-bottom: 1px solid #1e293b; padding-bottom: 8px; margin: 30px 0 16px 0;">💰 Agile Octopus Tariff ({octopus_report['date'].strftime('%A, %b %d')})</h3>
+        <p style="font-size: 13px; color: #94a3b8; margin-top: 0; margin-bottom: 12px;">Top 6 cheapest half-hourly timeslots (sorted by price ascending):</p>
+        <div style="background-color: #0f172a; border-radius: 10px; border: 1px solid #1e293b; overflow: hidden; margin-bottom: 30px;">
+            <table style="width: 100%; border-collapse: collapse;">
+                <thead>
+                    <tr style="border-bottom: 2px solid #1e293b; text-align: left; background-color: #0b0f19;">
+                        <th style="padding: 10px 8px; color: #64748b; font-size: 11px; font-weight: 700; text-transform: uppercase;">Timeslot</th>
+                        <th style="padding: 10px 8px; color: #64748b; font-size: 11px; font-weight: 700; text-transform: uppercase; text-align: right;">Price (inc. VAT)</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {octopus_rows}
+                </tbody>
+            </table>
+        </div>
+        """
+        
     html = f"""<!DOCTYPE html>
 <html>
 <head>
@@ -339,8 +517,10 @@ def format_html_email(report):
                 </tr>
             </table>
             
+            {octopus_section}
+            
             <!-- Hourly Forecast Table -->
-            <h3 style="font-size: 15px; font-weight: 700; color: #f8fafc; text-transform: uppercase; letter-spacing: 0.05em; border-bottom: 1px solid #1e293b; padding-bottom: 8px; margin: 0 0 16px 0;">Hourly Forecast (06:00 - 20:00)</h3>
+            <h3 style="font-size: 15px; font-weight: 700; color: #f8fafc; text-transform: uppercase; letter-spacing: 0.05em; border-bottom: 1px solid #1e293b; padding-bottom: 8px; margin: 0 0 16px 0;">Hourly Solar Forecast (06:00 - 20:00)</h3>
             <div style="overflow-x: auto;">
                 <table style="width: 100%; border-collapse: collapse;">
                     <thead>
@@ -427,7 +607,6 @@ def send_email(config, subject, html_content, text_content):
         return True
     except Exception as e:
         print(f"Error sending email: {e}")
-        # Save locally as fallback
         html_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "last_email.html")
         txt_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "last_email.txt")
         with open(html_file, "w", encoding="utf-8") as f:
@@ -461,7 +640,6 @@ def send_whatsapp(config, message):
             print("---------------------------------------------------------\n")
         return False
         
-    # URL encode parameters for CallMeBot GET request
     params = urllib.parse.urlencode({
         "phone": phone,
         "text": message,
@@ -479,7 +657,6 @@ def send_whatsapp(config, message):
             return True
     except Exception as e:
         print(f"Error sending WhatsApp message: {e}", file=sys.stderr)
-        # Save locally as fallback
         txt_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "last_whatsapp.txt")
         with open(txt_file, "w", encoding="utf-8") as f:
             f.write(message)
@@ -495,18 +672,23 @@ def main():
         azimuth = config["azimuth"]
         channel = config.get("channel", "whatsapp").lower()
         
-        raw_data = fetch_forecast(lat, lon, tilt, azimuth)
-        report = analyze_forecast(raw_data)
+        # 1. Fetch data
+        raw_solar_data = fetch_forecast(lat, lon, tilt, azimuth)
+        raw_octopus_rates = fetch_octopus_rates()
         
-        # Route depending on channel preference
+        # 2. Process data
+        solar_report = analyze_forecast(raw_solar_data)
+        octopus_report = process_octopus_rates(raw_octopus_rates, solar_report["date"])
+        
+        # 3. Format and Route
         if channel in ("whatsapp", "both"):
-            whatsapp_msg = format_whatsapp_message(report)
+            whatsapp_msg = format_whatsapp_message(solar_report, octopus_report)
             send_whatsapp(config, whatsapp_msg)
             
         if channel in ("email", "both"):
-            subject = f"Solar Charging Advisory: {report['rating']} potential tomorrow ({report['date'].strftime('%b %d')})"
-            text_content = format_text_email(report)
-            html_content = format_html_email(report)
+            subject = f"Solar Charging Advisory: {solar_report['rating']} potential tomorrow ({solar_report['date'].strftime('%b %d')})"
+            text_content = format_text_email(solar_report, octopus_report)
+            html_content = format_html_email(solar_report, octopus_report)
             send_email(config, subject, html_content, text_content)
             
         print("Forecast compilation complete.")

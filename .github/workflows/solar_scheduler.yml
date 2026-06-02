@@ -1,0 +1,36 @@
+name: Daily Solar Charging Scheduler
+
+on:
+  schedule:
+    # Runs at 19:00 UTC (7:00 PM GMT / 8:00 PM BST) every day
+    - cron: '0 19 * * *'
+  workflow_dispatch:
+    # Allows manual execution from the GitHub Actions tab for testing
+
+jobs:
+  run-scheduler:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Repository Code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    - name: Run Solar Scheduler Agent
+      env:
+        # Load configurations securely from GitHub Repository Secrets
+        WHATSAPP_PHONE: ${{ secrets.WHATSAPP_PHONE }}
+        WHATSAPP_APIKEY: ${{ secrets.WHATSAPP_APIKEY }}
+        SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
+        SENDER_PASSWORD: ${{ secrets.SENDER_PASSWORD }}
+        SOLAR_CHANNEL: ${{ secrets.SOLAR_CHANNEL }}
+        SOLAR_LATITUDE: "51.458"
+        SOLAR_LONGITUDE: "0.208"
+        SOLAR_TILT: "35"
+        SOLAR_AZIMUTH: "45"
+      run: |
+        python solar_scheduler.py
