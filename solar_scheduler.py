@@ -243,8 +243,21 @@ def fetch_octopus_rates(config, target_date):
             
     url = f"https://api.octopus.energy/v1/products/{product_code}/electricity-tariffs/{tariff_code}/standard-unit-rates/"
     
-    from_str = target_date.strftime("%Y-%m-%dT00:00:00Z")
-    to_str = target_date.strftime("%Y-%m-%dT23:59:59Z")
+    # Determine BST offset for target_date: BST (+1h) runs last Sun Mar → last Sun Oct
+    year = target_date.year
+    bst_start = (datetime.datetime(year, 3, 31, 1, 0, tzinfo=datetime.timezone.utc)
+                 - datetime.timedelta(days=(datetime.datetime(year, 3, 31).weekday() + 1) % 7)).date()
+    bst_end   = (datetime.datetime(year, 10, 31, 1, 0, tzinfo=datetime.timezone.utc)
+                 - datetime.timedelta(days=(datetime.datetime(year, 10, 31).weekday() + 1) % 7)).date()
+    utc_offset_hours = 1 if bst_start <= target_date < bst_end else 0
+
+    # Octopus rates are always UTC; query the UTC window that covers the full London day
+    from_dt = datetime.datetime(target_date.year, target_date.month, target_date.day,
+                                0, 0, 0) - datetime.timedelta(hours=utc_offset_hours)
+    to_dt   = datetime.datetime(target_date.year, target_date.month, target_date.day,
+                                23, 59, 59) - datetime.timedelta(hours=utc_offset_hours)
+    from_str = from_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    to_str   = to_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
     
     params = {
         "period_from": from_str,
@@ -270,42 +283,48 @@ def fetch_octopus_rates(config, target_date):
         print(f"Error fetching Octopus rates: {e}", file=sys.stderr)
         return []
 
+def utc_to_london(dt_utc):
+    """Convert a naive UTC datetime to a naive London local datetime (GMT or BST)."""
+    dt_aware = dt_utc.replace(tzinfo=datetime.timezone.utc)
+    year = dt_aware.year
+    bst_start = (datetime.datetime(year, 3, 31, 1, 0, tzinfo=datetime.timezone.utc)
+                 - datetime.timedelta(days=(datetime.datetime(year, 3, 31).weekday() + 1) % 7))
+    bst_end   = (datetime.datetime(year, 10, 31, 1, 0, tzinfo=datetime.timezone.utc)
+                 - datetime.timedelta(days=(datetime.datetime(year, 10, 31).weekday() + 1) % 7))
+    offset = datetime.timedelta(hours=1) if bst_start <= dt_aware < bst_end else datetime.timedelta(0)
+    return (dt_aware + offset).replace(tzinfo=None)
+
+def parse_octopus_time(valid_from_str):
+    """Parse an Octopus valid_from string (always UTC) and return London local time."""
+    try:
+        dt_utc = datetime.datetime.strptime(valid_from_str, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        dt_utc = datetime.datetime.strptime(valid_from_str[:19], "%Y-%m-%dT%H:%M:%S")
+    return utc_to_london(dt_utc)
+
 def process_octopus_rates(results, target_date):
     day_rates = []
     for r in results:
-        try:
-            valid_from = datetime.datetime.strptime(r["valid_from"], "%Y-%m-%dT%H:%M:%SZ")
-        except ValueError:
-            valid_from = datetime.datetime.strptime(r["valid_from"][:19], "%Y-%m-%dT%H:%M:%S")
-            
-        if valid_from.date() == target_date:
+        local_time = parse_octopus_time(r["valid_from"])
+        if local_time.date() == target_date:
             day_rates.append({
-                "time": valid_from,
+                "time": local_time,
                 "value": float(r["value_inc_vat"])
             })
-            
-    # Fallback to the most frequent date in the response if target_date has no records
+
+    # Fallback to the most frequent London-local date if target_date has no records
     if not day_rates and results:
-        dates_in_results = []
-        for r in results:
-            try:
-                dt = datetime.datetime.strptime(r["valid_from"], "%Y-%m-%dT%H:%M:%SZ")
-            except ValueError:
-                dt = datetime.datetime.strptime(r["valid_from"][:19], "%Y-%m-%dT%H:%M:%S")
-            dates_in_results.append(dt.date())
-            
+        dates_in_results = [parse_octopus_time(r["valid_from"]).date() for r in results]
+
         if dates_in_results:
             fallback_date = max(set(dates_in_results), key=dates_in_results.count)
             print(f"Tariff target date {target_date} not available. Using fallback date: {fallback_date}")
             target_date = fallback_date
             for r in results:
-                try:
-                    dt = datetime.datetime.strptime(r["valid_from"], "%Y-%m-%dT%H:%M:%SZ")
-                except ValueError:
-                    dt = datetime.datetime.strptime(r["valid_from"][:19], "%Y-%m-%dT%H:%M:%S")
-                if dt.date() == fallback_date:
+                local_time = parse_octopus_time(r["valid_from"])
+                if local_time.date() == fallback_date:
                     day_rates.append({
-                        "time": dt,
+                        "time": local_time,
                         "value": float(r["value_inc_vat"])
                     })
                     
