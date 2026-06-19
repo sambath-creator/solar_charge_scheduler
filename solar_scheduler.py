@@ -76,6 +76,24 @@ def get_weather_desc(code):
     }
     return wmo_codes.get(code, ("Unknown", "❓"))
 
+def get_london_time():
+    # Pure Python timezone helper to compute London local time (handling GMT/BST transitions)
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    year = now_utc.year
+    
+    # BST starts on the last Sunday of March at 1:00 AM UTC (2:00 AM BST)
+    march_31 = datetime.datetime(year, 3, 31, 1, 0, tzinfo=datetime.timezone.utc)
+    bst_start = march_31 - datetime.timedelta(days=(march_31.weekday() + 1) % 7)
+    
+    # BST ends on the last Sunday of October at 1:00 AM UTC (2:00 AM BST)
+    october_31 = datetime.datetime(year, 10, 31, 1, 0, tzinfo=datetime.timezone.utc)
+    bst_end = october_31 - datetime.timedelta(days=(october_31.weekday() + 1) % 7)
+    
+    if bst_start <= now_utc < bst_end:
+        return now_utc + datetime.timedelta(hours=1)
+    else:
+        return now_utc
+
 def fetch_forecast(lat, lon, tilt, azimuth):
     url = "https://api.open-meteo.com/v1/forecast"
     params = {
@@ -95,7 +113,7 @@ def fetch_forecast(lat, lon, tilt, azimuth):
     with urllib.request.urlopen(req) as response:
         return json.loads(response.read().decode())
 
-def analyze_forecast(data):
+def analyze_forecast(data, target_date):
     hourly = data.get("hourly", {})
     times = hourly.get("time", [])
     gti = hourly.get("global_tilted_irradiance", [])
@@ -103,20 +121,13 @@ def analyze_forecast(data):
     cloud = hourly.get("cloud_cover", [])
     code = hourly.get("weather_code", [])
     
-    dates = sorted(list(set(datetime.datetime.strptime(t, "%Y-%m-%dT%H:%M").date() for t in times)))
+    print(f"Filtering and analyzing solar forecast for date: {target_date}")
     
-    if len(dates) >= 2:
-        tomorrow = dates[1]
-    else:
-        tomorrow = dates[0]
-        
-    print(f"Analyzing solar forecast for date: {tomorrow}")
-    
-    tomorrow_hours = []
+    target_hours = []
     for t, g, tp, cl, cd in zip(times, gti, temp, cloud, code):
         dt = datetime.datetime.strptime(t, "%Y-%m-%dT%H:%M")
-        if dt.date() == tomorrow:
-            tomorrow_hours.append({
+        if dt.date() == target_date:
+            target_hours.append({
                 "time": dt,
                 "gti": float(g) if g is not None else 0.0,
                 "temp": tp,
@@ -124,14 +135,31 @@ def analyze_forecast(data):
                 "code": cd
             })
             
-    if not tomorrow_hours:
-        raise ValueError("No hourly forecast records found for tomorrow.")
+    # Fallback to the first available date in data if target_date is not in data
+    if not target_hours:
+        dates_available = sorted(list(set(datetime.datetime.strptime(t, "%Y-%m-%dT%H:%M").date() for t in times)))
+        if dates_available:
+            fallback_date = dates_available[0]
+            print(f"Warning: Target date {target_date} not in solar forecast. Falling back to: {fallback_date}")
+            target_date = fallback_date
+            for t, g, tp, cl, cd in zip(times, gti, temp, cloud, code):
+                dt = datetime.datetime.strptime(t, "%Y-%m-%dT%H:%M")
+                if dt.date() == fallback_date:
+                    target_hours.append({
+                        "time": dt,
+                        "gti": float(g) if g is not None else 0.0,
+                        "temp": tp,
+                        "cloud": cl,
+                        "code": cd
+                    })
+        else:
+            raise ValueError("No hourly forecast records found in API response.")
         
-    total_gti = sum(h["gti"] for h in tomorrow_hours)
+    total_gti = sum(h["gti"] for h in target_hours)
     total_energy_kwh = total_gti / 1000.0
-    peak_gti = max(h["gti"] for h in tomorrow_hours)
+    peak_gti = max(h["gti"] for h in target_hours)
     
-    daylight_hours = [h for h in tomorrow_hours if 6 <= h["time"].hour <= 20]
+    daylight_hours = [h for h in target_hours if 6 <= h["time"].hour <= 20]
     avg_temp = sum(h["temp"] for h in daylight_hours) / len(daylight_hours) if daylight_hours else 0.0
     avg_cloud = sum(h["cloud"] for h in daylight_hours) / len(daylight_hours) if daylight_hours else 0.0
     
@@ -144,7 +172,7 @@ def analyze_forecast(data):
     charging_hours = []
     threshold = 0.5 * peak_gti
     if peak_gti > 20.0:
-        charging_hours = [h for h in tomorrow_hours if h["gti"] >= threshold]
+        charging_hours = [h for h in target_hours if h["gti"] >= threshold]
         
     if charging_hours:
         start_hour = min(h["time"] for h in charging_hours)
@@ -169,7 +197,7 @@ def analyze_forecast(data):
         rating_color = "#ef4444"
         
     return {
-        "date": tomorrow,
+        "date": target_date,
         "total_energy": total_energy_kwh,
         "peak_gti": peak_gti,
         "avg_temp": avg_temp,
@@ -179,16 +207,15 @@ def analyze_forecast(data):
         "duration": duration,
         "rating": rating,
         "rating_color": rating_color,
-        "hourly_data": tomorrow_hours
+        "hourly_data": target_hours
     }
 
-def fetch_octopus_rates():
+def fetch_octopus_rates(target_date):
     # Agile Octopus Product Code: AGILE-24-10-01, Region J (South Eastern England)
     url = "https://api.octopus.energy/v1/products/AGILE-24-10-01/electricity-tariffs/E-1R-AGILE-24-10-01-J/standard-unit-rates/"
     
-    tomorrow = datetime.date.today() + datetime.timedelta(days=1)
-    from_str = tomorrow.strftime("%Y-%m-%dT00:00:00Z")
-    to_str = tomorrow.strftime("%Y-%m-%dT23:59:59Z")
+    from_str = target_date.strftime("%Y-%m-%dT00:00:00Z")
+    to_str = target_date.strftime("%Y-%m-%dT23:59:59Z")
     
     params = {
         "period_from": from_str,
@@ -203,9 +230,9 @@ def fetch_octopus_rates():
         with urllib.request.urlopen(req, timeout=15) as response:
             data = json.loads(response.read().decode())
             results = data.get("results", [])
-            # Fallback if no results returned for tomorrow
+            # Fallback if no results returned for date range
             if not results:
-                print("No tomorrow rates published yet. Fetching latest available rates page...")
+                print("No rates found in the requested date range. Fetching latest rates page as fallback...")
                 req_fallback = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
                 with urllib.request.urlopen(req_fallback, timeout=15) as resp_fallback:
                     data_fallback = json.loads(resp_fallback.read().decode())
@@ -241,7 +268,7 @@ def process_octopus_rates(results, target_date):
             
         if dates_in_results:
             fallback_date = max(set(dates_in_results), key=dates_in_results.count)
-            print(f"Target date {target_date} not available. Using fallback date: {fallback_date}")
+            print(f"Tariff target date {target_date} not available. Using fallback date: {fallback_date}")
             target_date = fallback_date
             for r in results:
                 try:
@@ -672,12 +699,21 @@ def main():
         azimuth = config["azimuth"]
         channel = config.get("channel", "whatsapp").lower()
         
+        # Determine target date: today if before 5 PM (17:00) London time, tomorrow if at/after
+        london_now = get_london_time()
+        if london_now.hour < 17:
+            target_date = london_now.date()
+            print(f"Current local time in London is {london_now.strftime('%I:%M %p')}. Running in BEFORE 5 PM mode. Target date is TODAY ({target_date}).")
+        else:
+            target_date = london_now.date() + datetime.timedelta(days=1)
+            print(f"Current local time in London is {london_now.strftime('%I:%M %p')}. Running in AFTER 5 PM mode. Target date is TOMORROW ({target_date}).")
+            
         # 1. Fetch data
         raw_solar_data = fetch_forecast(lat, lon, tilt, azimuth)
-        raw_octopus_rates = fetch_octopus_rates()
+        raw_octopus_rates = fetch_octopus_rates(target_date)
         
         # 2. Process data
-        solar_report = analyze_forecast(raw_solar_data)
+        solar_report = analyze_forecast(raw_solar_data, target_date)
         octopus_report = process_octopus_rates(raw_octopus_rates, solar_report["date"])
         
         # 3. Format and Route
@@ -686,7 +722,7 @@ def main():
             send_whatsapp(config, whatsapp_msg)
             
         if channel in ("email", "both"):
-            subject = f"Solar Charging Advisory: {solar_report['rating']} potential tomorrow ({solar_report['date'].strftime('%b %d')})"
+            subject = f"Solar Charging Advisory: {solar_report['rating']} potential ({solar_report['date'].strftime('%b %d')})"
             text_content = format_text_email(solar_report, octopus_report)
             html_content = format_html_email(solar_report, octopus_report)
             send_email(config, subject, html_content, text_content)

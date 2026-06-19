@@ -54,7 +54,7 @@ For a property in Dartford, UK:
 - **Azimuth**: Open-Meteo uses the convention: `0° = South`, `90° = West`. Since the panels face South-West, the azimuth is mapped to `45°`.
 
 ### Global Tilted Irradiance (GTI)
-Instead of standard Global Horizontal Irradiance (GHI) which assumes flat panels, the agent fetches **Global Tilted Irradiance (GTI)**. The Open-Meteo API calculates this dynamically using the specified `tilt` and `azimuth` to estimate the real sunlight hitting the SW-angled panel plane.
+Instead of using standard Global Horizontal Irradiance (GHI) which assumes flat panels, the agent fetches **Global Tilted Irradiance (GTI)**. The Open-Meteo API calculates this dynamically using the specified `tilt` and `azimuth` to estimate the real sunlight hitting the SW-angled panel plane.
 
 ### Optimal Battery Charging Window Algorithm
 We define the window based on peak daily intensity to maximize charging efficiency:
@@ -78,9 +78,17 @@ The agent queries the public Octopus Energy API to extract half-hourly unit rate
 - **Product Code**: `AGILE-24-10-01` (Active Agile Octopus tariff product).
 - **Tariff Code**: `E-1R-AGILE-24-10-01-J` (Region `J` corresponds to GSP Group _\_J_, representing South Eastern England/Dartford).
 
+### Time-Based Target Date Selection
+To ensure the reports are relevant depending on when the script executes, the agent implements a time boundary rule:
+- **BST-Aware Timezone Engine**: A custom mathematical algorithm calculates the local time in London by detecting the British Summer Time (BST) offset from UTC (last Sunday of March to last Sunday of October). This bypasses Windows/Linux system database discrepancies.
+- **5:00 PM Cutoff Rule**:
+  - If executed **before 5:00 PM (17:00) London time**, the target date is set to **Today**.
+  - If executed **at or after 5:00 PM (17:00) London time**, the target date is set to **Tomorrow** (as tomorrow's rates are published by 4:00 PM).
+  - The solar forecast calculations and the Agile Octopus rates both align to the chosen target date.
+
 ### Algorithmic Processing of Tariff Data
-1. **Query Date-Filtered Window**: The agent queries rates for the target forecast date (tomorrow) using `period_from` and `period_to` parameters.
-2. **Fallback Logic**: If the script is run before tomorrow's rates are published (which occurs daily at 4:00 PM UK time), it falls back to the most complete date available in the active API response.
+1. **Query Date-Filtered Window**: The agent queries rates for the target forecast date using `period_from` and `period_to` parameters.
+2. **Fallback Logic**: If the API has not published rates for the requested date, it gracefully falls back to the most complete date in the API response page.
 3. **Cheapest Slots Sorting**: 
    - The list of 48 half-hour slots is sorted in **ascending order** of unit price (`value_inc_vat`).
    - The **top 6 cheapest slots** are extracted.
