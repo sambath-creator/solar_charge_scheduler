@@ -3,7 +3,7 @@ name: Daily Solar Charging Scheduler
 on:
   schedule:
     # Runs at 19:00 UTC (7:00 PM GMT / 8:00 PM BST) every day
-    - cron: '0 19 * * *'
+    - cron: '0 18 * * *'
   workflow_dispatch:
     inputs:
       dry_run:
