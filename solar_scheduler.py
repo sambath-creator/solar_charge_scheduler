@@ -375,9 +375,10 @@ def format_whatsapp_message(report, octopus_report):
         msg += "Time      Price (inc VAT)\n"
         msg += "-------------------------\n"
         for r in octopus_report["by_price"]:
-            time_str = r["time"].strftime("%I:%M %p")
+            end_time = r["time"] + datetime.timedelta(minutes=30)
+            time_str = f"{r['time'].strftime('%I:%M')}-{end_time.strftime('%I:%M %p')}"
             val_str = f"{r['value']:.2f} p/kWh"
-            msg += f"{time_str:<9} {val_str:<15}\n"
+            msg += f"{time_str:<18} {val_str:<15}\n"
         msg += "```\n"
         
         msg += f"📅 *Top 6 Chronological Flow*:\n"
@@ -385,9 +386,10 @@ def format_whatsapp_message(report, octopus_report):
         msg += "Time      Price (inc VAT)\n"
         msg += "-------------------------\n"
         for r in octopus_report["by_time"]:
-            time_str = r["time"].strftime("%I:%M %p")
+            end_time = r["time"] + datetime.timedelta(minutes=30)
+            time_str = f"{r['time'].strftime('%I:%M')}-{end_time.strftime('%I:%M %p')}"
             val_str = f"{r['value']:.2f} p/kWh"
-            msg += f"{time_str:<9} {val_str:<15}\n"
+            msg += f"{time_str:<18} {val_str:<15}\n"
         msg += "```\n"
         
     msg += f"📅 *Hourly Solar Forecast*:\n"
@@ -431,7 +433,9 @@ Key Forecast Metrics:
         text += "---------------------\n"
         text += "Top 6 Cheapest timeslots (sorted ascending):\n"
         for r in octopus_report["by_price"]:
-            text += f"* {r['time'].strftime('%I:%M %p')} : {r['value']:.2f} p/kWh\n"
+            end_time = r["time"] + datetime.timedelta(minutes=30)
+            slot_str = f"{r['time'].strftime('%I:%M')}-{end_time.strftime('%I:%M %p')}"
+            text += f"* {slot_str} : {r['value']:.2f} p/kWh\n"
 
     text += """
 Hourly Breakdown (06:00 - 20:00):
@@ -487,7 +491,8 @@ def format_html_email(report, octopus_report):
     if octopus_report and octopus_report["by_price"]:
         octopus_rows = ""
         for r in octopus_report["by_price"]:
-            time_str = r["time"].strftime("%I:%M %p")
+            end_time = r["time"] + datetime.timedelta(minutes=30)
+            time_str = f"{r['time'].strftime('%I:%M')}–{end_time.strftime('%I:%M %p')}"
             val_str = f"{r['value']:.2f} p/kWh"
             
             is_cheapest = r == octopus_report["by_price"][0]
