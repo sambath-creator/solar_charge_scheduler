@@ -5,7 +5,12 @@ on:
     # Runs at 19:00 UTC (7:00 PM GMT / 8:00 PM BST) every day
     - cron: '0 19 * * *'
   workflow_dispatch:
-    # Allows manual execution from the GitHub Actions tab for testing
+    inputs:
+      dry_run:
+        description: 'Dry Run Mode (saves preview files locally on the runner, does not send messages)'
+        required: true
+        type: boolean
+        default: false
 
 jobs:
   run-scheduler:
@@ -22,7 +27,6 @@ jobs:
 
     - name: Run Solar Scheduler Agent
       env:
-        # Load configurations securely from GitHub Repository Secrets
         WHATSAPP_PHONE: ${{ secrets.WHATSAPP_PHONE }}
         WHATSAPP_APIKEY: ${{ secrets.WHATSAPP_APIKEY }}
         SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
@@ -33,4 +37,20 @@ jobs:
         SOLAR_TILT: "35"
         SOLAR_AZIMUTH: "45"
       run: |
-        python solar_scheduler.py
+        if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+          echo "Executing in manual Dry Run mode..."
+          python solar_scheduler.py --dry-run
+        else
+          python solar_scheduler.py
+        fi
+
+    - name: Upload Preview Artifacts
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: solar-scheduler-previews
+        path: |
+          last_whatsapp.txt
+          last_email.html
+          last_email.txt
+        if-no-files-found: ignore
