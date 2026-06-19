@@ -27,8 +27,8 @@ def load_config():
     config["azimuth"] = float(os.environ.get("SOLAR_AZIMUTH", config.get("azimuth", 45)))
     config["recipient_email"] = os.environ.get("SOLAR_RECIPIENT_EMAIL", config.get("recipient_email", "sambathknair@gmail.com"))
     
-    # Load Octopus Tariff Code from config or environment
-    config["octopus_tariff_code"] = os.environ.get("OCTOPUS_TARIFF_CODE", config.get("octopus_tariff_code", "E-1R-AGILE-24-10-01-C"))
+    # DNO region code for Agile Octopus tariff (C = South East England / Dartford)
+    config["octopus_region"] = os.environ.get("OCTOPUS_REGION", config.get("octopus_region", "C"))
     
     if "whatsapp" not in config:
         config["whatsapp"] = {}
@@ -231,57 +231,96 @@ def analyze_forecast(data, target_date):
         "hourly_data": target_hours
     }
 
-def fetch_octopus_rates(config, target_date):
-    # Retrieve dynamic tariff and extract product code
-    tariff_code = config.get("octopus_tariff_code", "E-1R-AGILE-24-10-01-C")
-    product_code = "AGILE-24-10-01"
-    
-    if tariff_code.startswith("E-1R-"):
-        parts = tariff_code[5:].split("-")
-        if len(parts) >= 4:
-            product_code = "-".join(parts[:-1])
-            
-    url = f"https://api.octopus.energy/v1/products/{product_code}/electricity-tariffs/{tariff_code}/standard-unit-rates/"
-    
-    # Determine BST offset for target_date: BST (+1h) runs last Sun Mar → last Sun Oct
+def get_london_utc_window(target_date):
+    """Return (from_str, to_str) in UTC covering the full London calendar day."""
     year = target_date.year
     bst_start = (datetime.datetime(year, 3, 31, 1, 0, tzinfo=datetime.timezone.utc)
                  - datetime.timedelta(days=(datetime.datetime(year, 3, 31).weekday() + 1) % 7)).date()
     bst_end   = (datetime.datetime(year, 10, 31, 1, 0, tzinfo=datetime.timezone.utc)
                  - datetime.timedelta(days=(datetime.datetime(year, 10, 31).weekday() + 1) % 7)).date()
     utc_offset_hours = 1 if bst_start <= target_date < bst_end else 0
-
-    # Octopus rates are always UTC; query the UTC window that covers the full London day
     from_dt = datetime.datetime(target_date.year, target_date.month, target_date.day,
                                 0, 0, 0) - datetime.timedelta(hours=utc_offset_hours)
     to_dt   = datetime.datetime(target_date.year, target_date.month, target_date.day,
                                 23, 59, 59) - datetime.timedelta(hours=utc_offset_hours)
-    from_str = from_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-    to_str   = to_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-    
-    params = {
-        "period_from": from_str,
-        "period_to": to_str
-    }
-    query_string = urllib.parse.urlencode(params)
-    full_url = f"{url}?{query_string}"
-    
-    print(f"Fetching Agile Octopus rates from: {full_url}")
-    req = urllib.request.Request(full_url, headers={'User-Agent': 'Mozilla/5.0'})
+    return from_dt.strftime("%Y-%m-%dT%H:%M:%SZ"), to_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def get_latest_agile_tariff(region_code="C"):
+    """
+    Query the Octopus products API to find the latest active Agile tariff code
+    for the given DNO region code (default C = South East England / Dartford).
+    Falls back to a known default if the API call fails.
+    """
+    default = f"E-1R-AGILE-24-10-01-{region_code}"
     try:
-        with urllib.request.urlopen(req, timeout=15) as response:
-            data = json.loads(response.read().decode())
-            results = data.get("results", [])
-            if not results:
-                print("No rates found in the requested date range. Fetching latest rates page as fallback...")
-                req_fallback = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-                with urllib.request.urlopen(req_fallback, timeout=15) as resp_fallback:
-                    data_fallback = json.loads(resp_fallback.read().decode())
-                    results = data_fallback.get("results", [])
-            return results
+        url = "https://api.octopus.energy/v1/products/?brand=OCTOPUS_ENERGY&is_variable=true&page_size=100"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode())
+        products = data.get("results", [])
+        # Active Agile products have available_to = None; sort latest first
+        agile = [p for p in products
+                 if p.get("code", "").startswith("AGILE-")
+                 and p.get("available_to") is None]
+        if not agile:
+            # Widen to recently-ended products in case of brief listing lag
+            agile = [p for p in products if p.get("code", "").startswith("AGILE-")]
+        if not agile:
+            print(f"No Agile products found; using default tariff {default}", file=sys.stderr)
+            return default
+        agile.sort(key=lambda p: (p.get("available_from") or ""), reverse=True)
+        latest_product_code = agile[0]["code"]
+        tariff_code = f"E-1R-{latest_product_code}-{region_code}"
+        print(f"Latest Agile product: {latest_product_code} -> tariff {tariff_code}")
+        return tariff_code
     except Exception as e:
-        print(f"Error fetching Octopus rates: {e}", file=sys.stderr)
+        print(f"Could not discover latest Agile tariff ({e}); using default {default}", file=sys.stderr)
+        return default
+
+def fetch_rates_for_date(tariff_code, product_code, target_date):
+    """Fetch Octopus half-hourly rates for a specific London calendar date. Returns list or []."""
+    url = (f"https://api.octopus.energy/v1/products/{product_code}"
+           f"/electricity-tariffs/{tariff_code}/standard-unit-rates/")
+    from_str, to_str = get_london_utc_window(target_date)
+    params = {"period_from": from_str, "period_to": to_str}
+    full_url = f"{url}?{urllib.parse.urlencode(params)}"
+    print(f"Fetching Agile rates for {target_date}: {full_url}")
+    try:
+        req = urllib.request.Request(full_url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read().decode()).get("results", [])
+    except Exception as e:
+        print(f"Error fetching rates for {target_date}: {e}", file=sys.stderr)
         return []
+
+def fetch_octopus_rates(config, solar_target_date):
+    """
+    Resolve the latest Agile tariff dynamically, then try tomorrow's rates first.
+    Falls back to today's rates if tomorrow's are not yet published by Octopus.
+    Returns (results, octopus_date).
+    """
+    region_code  = config.get("octopus_region", "C")
+    tariff_code  = get_latest_agile_tariff(region_code)
+    # Derive product code from tariff code: "E-1R-AGILE-X-XX-XX-C" -> "AGILE-X-XX-XX"
+    if tariff_code.startswith("E-1R-"):
+        product_code = "-".join(tariff_code[5:].split("-")[:-1])
+    else:
+        product_code = tariff_code  # unexpected format; pass through as-is
+
+    london_now = get_london_time()
+    tomorrow   = london_now.date() + datetime.timedelta(days=1)
+    today      = london_now.date()
+
+    # Always try tomorrow first — Octopus publishes next-day rates around 4 PM
+    results = fetch_rates_for_date(tariff_code, product_code, tomorrow)
+    if results:
+        print(f"Tomorrow's Agile rates are available ({tomorrow}).")
+        return results, tomorrow
+
+    # Tomorrow not published yet — use today's rates
+    print(f"Tomorrow's rates not yet published; falling back to today ({today}).")
+    results = fetch_rates_for_date(tariff_code, product_code, today)
+    return results, today
 
 def utc_to_london(dt_utc):
     """Convert a naive UTC datetime to a naive London local datetime (GMT or BST)."""
@@ -312,43 +351,26 @@ def process_octopus_rates(results, target_date):
                 "value": float(r["value_inc_vat"])
             })
 
-    # Fallback to the most frequent London-local date if target_date has no records
-    if not day_rates and results:
-        dates_in_results = [parse_octopus_time(r["valid_from"]).date() for r in results]
-
-        if dates_in_results:
-            fallback_date = max(set(dates_in_results), key=dates_in_results.count)
-            print(f"Tariff target date {target_date} not available. Using fallback date: {fallback_date}")
-            target_date = fallback_date
-            for r in results:
-                local_time = parse_octopus_time(r["valid_from"])
-                if local_time.date() == fallback_date:
-                    day_rates.append({
-                        "time": local_time,
-                        "value": float(r["value_inc_vat"])
-                    })
-                    
     if not day_rates:
         return {
             "date": target_date,
             "by_price": [],
             "by_time": []
         }
-        
+
     # Sort by price ascending to extract top 6
     cheapest = sorted(day_rates, key=lambda x: x["value"])
     top_6 = cheapest[:6]
-    
-    # Sort configurations:
+
     # 1. Sorted by price ascending (cheapest first)
     top_6_by_price = sorted(top_6, key=lambda x: x["value"])
     # 2. Sorted by time ascending (chronological flow)
-    top_6_by_time = sorted(top_6, key=lambda x: x["time"])
-    
+    top_6_by_time  = sorted(top_6, key=lambda x: x["time"])
+
     return {
         "date": target_date,
         "by_price": top_6_by_price,
-        "by_time": top_6_by_time
+        "by_time":  top_6_by_time
     }
 
 def format_whatsapp_message(report, octopus_report):
@@ -755,22 +777,23 @@ def main():
         azimuth = config["azimuth"]
         channel = config.get("channel", "whatsapp").lower()
         
-        # Determine target date: today if before 5 PM (17:00) London time, tomorrow if at/after
+        # Solar target date: today before 5 PM London time, tomorrow otherwise
         london_now = get_london_time()
         if london_now.hour < 17:
-            target_date = london_now.date()
-            print(f"Current local time in London is {london_now.strftime('%I:%M %p')}. Running in BEFORE 5 PM mode. Target date is TODAY ({target_date}).")
+            solar_target_date = london_now.date()
+            print(f"London time {london_now.strftime('%I:%M %p')}: solar target is TODAY ({solar_target_date}).")
         else:
-            target_date = london_now.date() + datetime.timedelta(days=1)
-            print(f"Current local time in London is {london_now.strftime('%I:%M %p')}. Running in AFTER 5 PM mode. Target date is TOMORROW ({target_date}).")
-            
+            solar_target_date = london_now.date() + datetime.timedelta(days=1)
+            print(f"London time {london_now.strftime('%I:%M %p')}: solar target is TOMORROW ({solar_target_date}).")
+
         # 1. Fetch data
         raw_solar_data = fetch_forecast(lat, lon, tilt, azimuth)
-        raw_octopus_rates = fetch_octopus_rates(config, target_date)
-        
+        # Octopus: try tomorrow first; fall back to today if not yet published
+        raw_octopus_rates, octopus_date = fetch_octopus_rates(config, solar_target_date)
+
         # 2. Process data
-        solar_report = analyze_forecast(raw_solar_data, target_date)
-        octopus_report = process_octopus_rates(raw_octopus_rates, solar_report["date"])
+        solar_report   = analyze_forecast(raw_solar_data, solar_target_date)
+        octopus_report = process_octopus_rates(raw_octopus_rates, octopus_date)
         
         # 3. Format and Route
         if channel in ("whatsapp", "both"):
