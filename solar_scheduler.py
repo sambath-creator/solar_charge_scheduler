@@ -25,8 +25,10 @@ def load_config():
     config["longitude"] = float(os.environ.get("SOLAR_LONGITUDE", config.get("longitude", 0.208)))
     config["tilt"] = float(os.environ.get("SOLAR_TILT", config.get("tilt", 35)))
     config["azimuth"] = float(os.environ.get("SOLAR_AZIMUTH", config.get("azimuth", 45)))
-    config["channel"] = os.environ.get("SOLAR_CHANNEL", config.get("channel", "whatsapp")).lower()
     config["recipient_email"] = os.environ.get("SOLAR_RECIPIENT_EMAIL", config.get("recipient_email", "sambathknair@gmail.com"))
+    
+    # Load Octopus Tariff Code from config or environment
+    config["octopus_tariff_code"] = os.environ.get("OCTOPUS_TARIFF_CODE", config.get("octopus_tariff_code", "E-1R-AGILE-24-10-01-C"))
     
     if "whatsapp" not in config:
         config["whatsapp"] = {}
@@ -41,6 +43,25 @@ def load_config():
     config["smtp"]["sender_email"] = os.environ.get("SENDER_EMAIL", config["smtp"].get("sender_email", ""))
     config["smtp"]["sender_password"] = os.environ.get("SENDER_PASSWORD", config["smtp"].get("sender_password", ""))
     
+    # Determine the notification channel
+    # Prioritizes explicit env variable first, then config.json.
+    # Fallback: Auto-config based on populated secrets
+    channel_env = os.environ.get("SOLAR_CHANNEL")
+    if channel_env:
+        config["channel"] = channel_env.lower()
+    elif "channel" in config:
+        config["channel"] = config["channel"].lower()
+    else:
+        # Auto-detect channels based on available configuration/credentials
+        has_whatsapp = bool(config["whatsapp"]["phone"] and config["whatsapp"]["apikey"])
+        has_smtp = bool(config["smtp"]["sender_email"] and config["smtp"]["sender_password"])
+        if has_whatsapp and has_smtp:
+            config["channel"] = "both"
+        elif has_smtp:
+            config["channel"] = "email"
+        else:
+            config["channel"] = "whatsapp"
+            
     return config
 
 def get_weather_desc(code):
@@ -210,9 +231,17 @@ def analyze_forecast(data, target_date):
         "hourly_data": target_hours
     }
 
-def fetch_octopus_rates(target_date):
-    # Agile Octopus Product Code: AGILE-24-10-01, Region J (South Eastern England)
-    url = "https://api.octopus.energy/v1/products/AGILE-24-10-01/electricity-tariffs/E-1R-AGILE-24-10-01-J/standard-unit-rates/"
+def fetch_octopus_rates(config, target_date):
+    # Retrieve dynamic tariff and extract product code
+    tariff_code = config.get("octopus_tariff_code", "E-1R-AGILE-24-10-01-C")
+    product_code = "AGILE-24-10-01"
+    
+    if tariff_code.startswith("E-1R-"):
+        parts = tariff_code[5:].split("-")
+        if len(parts) >= 4:
+            product_code = "-".join(parts[:-1])
+            
+    url = f"https://api.octopus.energy/v1/products/{product_code}/electricity-tariffs/{tariff_code}/standard-unit-rates/"
     
     from_str = target_date.strftime("%Y-%m-%dT00:00:00Z")
     to_str = target_date.strftime("%Y-%m-%dT23:59:59Z")
@@ -230,7 +259,6 @@ def fetch_octopus_rates(target_date):
         with urllib.request.urlopen(req, timeout=15) as response:
             data = json.loads(response.read().decode())
             results = data.get("results", [])
-            # Fallback if no results returned for date range
             if not results:
                 print("No rates found in the requested date range. Fetching latest rates page as fallback...")
                 req_fallback = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
@@ -398,11 +426,15 @@ Hourly Breakdown (06:00 - 20:00):
             bar = "#" * bar_len + "-" * (20 - bar_len)
             text += f"{time_str:<8} | {h['gti']:>4.0f} W/m² | [{bar}] | {h['temp']:>4.1f}°C | {h['cloud']:>3d}% Cloud\n"
             
-    text += f"\nLocation: 9 Foster Drive, Dartford DA1 5UB, UK\nPanels: South-West facing (Tilt: 35°, Azimuth: 45°)\nGenerated at {datetime.datetime.now().strftime('%Y-%m-%d %I:%M %p')}\n"
+    london_now = get_london_time()
+    tz_label = "BST" if london_now.utcoffset() and london_now.utcoffset().seconds == 3600 else "GMT"
+    text += f"\nLocation: 9 Foster Drive, Dartford DA1 5UB, UK\nPanels: South-West facing (Tilt: 35°, Azimuth: 45°)\nGenerated at {london_now.strftime('%Y-%m-%d %I:%M %p')} {tz_label}\n"
     return text
 
 def format_html_email(report, octopus_report):
     weather_desc, weather_emoji = get_weather_desc(report["weather_code"])
+    london_now = get_london_time()
+    tz_label = "BST" if london_now.utcoffset() and london_now.utcoffset().seconds == 3600 else "GMT"
     
     hourly_rows = ""
     for h in report["hourly_data"]:
@@ -571,7 +603,7 @@ def format_html_email(report, octopus_report):
         <div style="background-color: #0b0f19; padding: 20px 30px; border-top: 1px solid #1e293b; text-align: center; font-size: 12px; color: #64748b;">
             <p style="margin: 0 0 6px 0;"><b>Location:</b> 9 Foster Drive, Dartford DA1 5UB, UK</p>
             <p style="margin: 0 0 12px 0;"><b>Panel Configuration:</b> South-West facing | Tilt: 35° | Azimuth: 45°</p>
-            <p style="margin: 0; font-size: 10px; color: #475569;">Generated automatically by Solar Optimizer Agent at {datetime.datetime.now().strftime('%I:%M %p %Z')}</p>
+            <p style="margin: 0; font-size: 10px; color: #475569;">Generated automatically by Solar Optimizer Agent at {london_now.strftime('%I:%M %p')} {tz_label}</p>
         </div>
     </div>
 </body>
@@ -710,7 +742,7 @@ def main():
             
         # 1. Fetch data
         raw_solar_data = fetch_forecast(lat, lon, tilt, azimuth)
-        raw_octopus_rates = fetch_octopus_rates(target_date)
+        raw_octopus_rates = fetch_octopus_rates(config, target_date)
         
         # 2. Process data
         solar_report = analyze_forecast(raw_solar_data, target_date)
